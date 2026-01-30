@@ -375,6 +375,11 @@ class ActionRecorder:
         # Mouse/keyboard listeners
         self._mouse_listener = None
         self._keyboard_listener = None
+
+        # Win32 low-level scroll hook (pynput often misses scroll on Windows)
+        self._scroll_hook = None
+        self._scroll_hook_thread = None
+        self._scroll_hook_proc_ref = None  # prevent GC of the callback
     
     def _generate_action_id(self) -> str:
         """Generate unique action ID."""
@@ -489,10 +494,12 @@ class ActionRecorder:
         # Import here to avoid issues if not installed
         from pynput import mouse, keyboard
         
-        # Mouse listener
+        # Mouse listener (scroll handled by Win32 hook on Windows for reliability)
+        import platform
+        scroll_handler = None if platform.system() == "Windows" else self._on_mouse_scroll
         self._mouse_listener = mouse.Listener(
             on_click=self._on_mouse_click,
-            on_scroll=self._on_mouse_scroll
+            on_scroll=scroll_handler
         )
         
         # Keyboard listener
@@ -503,7 +510,10 @@ class ActionRecorder:
         
         self._mouse_listener.start()
         self._keyboard_listener.start()
-        
+
+        # Start Win32 low-level scroll hook for reliable scroll capture
+        self._start_win32_scroll_hook()
+
         logger.info("Recording started")
     
     def pause_recording(self) -> None:
@@ -530,7 +540,8 @@ class ActionRecorder:
             self._mouse_listener.stop()
         if self._keyboard_listener:
             self._keyboard_listener.stop()
-        
+        self._stop_win32_scroll_hook()
+
         logger.info(f"Recording stopped. {len(self._actions)} actions recorded.")
         return self._actions.copy()
     
@@ -752,10 +763,116 @@ class ActionRecorder:
         # But we can use this to detect held keys if needed
         pass
     
+    # ===== Win32 Scroll Hook (reliable scroll capture on Windows) =====
+
+    def _start_win32_scroll_hook(self) -> None:
+        """Install a Win32 low-level mouse hook to capture scroll events reliably."""
+        import platform
+        if platform.system() != "Windows":
+            return
+
+        import ctypes
+        import ctypes.wintypes
+
+        WH_MOUSE_LL = 14
+        WM_MOUSEWHEEL = 0x020A
+        WM_MOUSEHWHEEL = 0x020E
+
+        class MSLLHOOKSTRUCT(ctypes.Structure):
+            _fields_ = [
+                ('pt', ctypes.wintypes.POINT),
+                ('mouseData', ctypes.wintypes.DWORD),
+                ('flags', ctypes.wintypes.DWORD),
+                ('time', ctypes.wintypes.DWORD),
+                ('dwExtraInfo', ctypes.POINTER(ctypes.c_ulong)),
+            ]
+
+        LowLevelMouseProc = ctypes.WINFUNCTYPE(
+            ctypes.c_long,
+            ctypes.c_int,
+            ctypes.wintypes.WPARAM,
+            ctypes.wintypes.LPARAM,
+        )
+
+        user32 = ctypes.WinDLL('user32', use_last_error=True)
+        user32.SetWindowsHookExW.argtypes = [
+            ctypes.c_int, LowLevelMouseProc,
+            ctypes.wintypes.HINSTANCE, ctypes.wintypes.DWORD,
+        ]
+        user32.SetWindowsHookExW.restype = ctypes.c_void_p
+        user32.CallNextHookEx.argtypes = [
+            ctypes.c_void_p, ctypes.c_int,
+            ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM,
+        ]
+        user32.CallNextHookEx.restype = ctypes.c_long
+        user32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
+        user32.GetMessageW.argtypes = [
+            ctypes.POINTER(ctypes.wintypes.MSG),
+            ctypes.wintypes.HWND, ctypes.c_uint, ctypes.c_uint,
+        ]
+        user32.PostThreadMessageW.argtypes = [
+            ctypes.wintypes.DWORD, ctypes.c_uint,
+            ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM,
+        ]
+
+        recorder_self = self  # prevent closure issues
+
+        @LowLevelMouseProc
+        def low_level_mouse_proc(nCode, wParam, lParam):
+            if nCode >= 0 and wParam in (WM_MOUSEWHEEL, WM_MOUSEHWHEEL):
+                ms = ctypes.cast(lParam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
+                delta = ctypes.c_short(ms.mouseData >> 16).value
+                clicks = delta // 120 if delta != 0 else 0
+                x, y = ms.pt.x, ms.pt.y
+                if wParam == WM_MOUSEWHEEL:
+                    recorder_self._on_mouse_scroll(x, y, 0, clicks)
+                else:
+                    recorder_self._on_mouse_scroll(x, y, clicks, 0)
+            return user32.CallNextHookEx(None, nCode, wParam, lParam)
+
+        self._scroll_hook_proc_ref = low_level_mouse_proc
+        self._scroll_user32 = user32  # prevent GC
+
+        def hook_thread():
+            self._scroll_hook = user32.SetWindowsHookExW(
+                WH_MOUSE_LL, self._scroll_hook_proc_ref, None, 0,
+            )
+            if not self._scroll_hook:
+                logger.warning("Failed to install Win32 scroll hook")
+                return
+
+            logger.debug(f"Win32 scroll hook installed: {self._scroll_hook}")
+
+            # Message loop required for the hook to receive events
+            msg = ctypes.wintypes.MSG()
+            while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+
+        self._scroll_hook_thread = threading.Thread(target=hook_thread, daemon=True)
+        self._scroll_hook_thread.start()
+
+    def _stop_win32_scroll_hook(self) -> None:
+        """Remove the Win32 scroll hook."""
+        if self._scroll_hook and hasattr(self, '_scroll_user32'):
+            user32 = self._scroll_user32
+            user32.UnhookWindowsHookEx(self._scroll_hook)
+            # Post WM_QUIT to break the message loop
+            if self._scroll_hook_thread and self._scroll_hook_thread.is_alive():
+                thread_id = self._scroll_hook_thread.ident
+                if thread_id:
+                    user32.PostThreadMessageW(int(thread_id), 0x0012, 0, 0)
+                self._scroll_hook_thread.join(timeout=2)
+            self._scroll_hook = None
+            self._scroll_hook_thread = None
+            self._scroll_hook_proc_ref = None
+            self._scroll_user32 = None
+            logger.debug("Win32 scroll hook removed")
+
     def get_actions(self) -> List[RecordedAction]:
         """Get current recorded actions."""
         return self._actions.copy()
-    
+
     def close(self) -> None:
         """Clean up resources."""
         if self._recording:

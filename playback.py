@@ -469,13 +469,20 @@ class PlaybackEngine:
         return None
     
     def _execute_scroll(self, action: RecordedAction) -> Optional[str]:
-        """Execute scroll action."""
+        """Execute scroll action (vertical and horizontal)."""
         if action.x is not None and action.y is not None:
             pyautogui.moveTo(action.x, action.y)
-        
-        # PyAutoGUI scroll uses clicks, dy is typically -1 or 1
-        clicks = action.dy if action.dy else 0
-        pyautogui.scroll(clicks)
+
+        # Vertical scroll
+        dy = action.dy if action.dy else 0
+        if dy:
+            pyautogui.scroll(dy)
+
+        # Horizontal scroll
+        dx = action.dx if action.dx else 0
+        if dx:
+            pyautogui.hscroll(dx)
+
         return None
     
     def _execute_key_press(self, action: RecordedAction) -> Optional[str]:
