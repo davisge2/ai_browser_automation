@@ -5,7 +5,8 @@ A production-grade desktop automation tool that records user actions (clicks, ty
 ## Features
 
 ### Recording
-- **Full Desktop Recording** — captures mouse clicks, keyboard input, scrolling, and drag actions
+- **Full Desktop Recording** — captures mouse clicks, keyboard input, scrolling (vertical + horizontal), and drag actions
+- **Reliable Scroll Capture** — dedicated Win32 low-level mouse hook (`WH_MOUSE_LL`) for scroll events on Windows, with debounced accumulation to batch rapid scroll ticks into single actions
 - **Visual Context** — screenshots captured around click points for reliable playback verification
 - **Credential Protection** — passwords are never recorded; only secure references are stored
 - **Manual Screenshots** — take screenshots at any point during recording via floating toolbar
@@ -33,6 +34,7 @@ A production-grade desktop automation tool that records user actions (clicks, ty
 ### Playback
 - **Visual Verification** — verifies screen state before clicking using image matching
 - **Smart Retry** — automatic retry on failure with configurable attempts
+- **Scroll Replay** — replays both vertical and horizontal scroll actions at recorded positions
 - **Speed Control** — adjust playback speed multiplier
 - **Page Load Detection** — screen-hash-based stability detection to measure page load times
 - **Abort Safety** — PyAutoGUI failsafe (move mouse to corner to abort)
@@ -127,7 +129,7 @@ python run.py --check     # verify dependencies
 ```
 ai_browser_automation/
 ├── run.py               # Entry point (GUI launcher + dependency checker)
-├── recorder.py          # Action recording engine (pynput mouse/keyboard listeners)
+├── recorder.py          # Action recording engine (pynput + Win32 scroll hook)
 ├── playback.py          # Playback engine with visual verification and retry
 ├── ai_engine.py         # Anthropic Claude integration for screenshot analysis
 ├── report_generator.py  # Self-contained HTML audit report generator
