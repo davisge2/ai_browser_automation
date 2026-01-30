@@ -3,3 +3,10 @@ __pycache__/
 *.pyc
 nul
 .desktop-automation/
+*.db
+*.enc
+salt.bin
+.env
+.env.*
+credentials/
+*.log

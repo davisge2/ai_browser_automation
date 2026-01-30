@@ -113,11 +113,11 @@ def main():
     )
     
     args = parser.parse_args()
-    
-    # Create app directory
+
+    # Create app directory before logging (log file goes here)
     app_dir = Path.home() / ".desktop-automation"
     app_dir.mkdir(exist_ok=True)
-    
+
     setup_logging(args.verbose)
     check_dependencies()
     

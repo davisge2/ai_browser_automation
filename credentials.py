@@ -282,35 +282,41 @@ class CredentialManager:
         return deleted
     
     def export_credentials(self, export_password: str) -> bytes:
-        """Export all credentials encrypted with a separate password."""
+        """Export all credentials encrypted with a separate password.
+
+        Format: 16-byte salt prefix + Fernet-encrypted JSON payload.
+        The salt is stored unencrypted so import can derive the same key.
+        """
         credentials = self._load_credentials_file()
         export_encryption = EncryptionManager(export_password)
-        
-        export_data = {
-            "salt": base64.b64encode(export_encryption.salt).decode(),
-            "credentials": credentials
-        }
-        
-        return export_encryption.encrypt_dict(export_data)
+
+        encrypted = export_encryption.encrypt_dict(credentials)
+        # Prefix the salt so import_credentials can reconstruct the key
+        return export_encryption.salt + encrypted
     
     def import_credentials(self, data: bytes, import_password: str) -> int:
-        """Import credentials from encrypted export."""
-        # First decrypt outer layer
-        temp_encryption = EncryptionManager(import_password)
-        
+        """Import credentials from encrypted export.
+
+        Format: 16-byte salt prefix + Fernet-encrypted JSON payload.
+        """
+        if len(data) < 17:
+            raise ValueError("Invalid export data")
+
+        salt = data[:16]
+        encrypted = data[16:]
+        import_encryption = EncryptionManager(import_password, salt=salt)
+
         try:
-            decrypted = temp_encryption.decrypt_dict(data)
+            credentials = import_encryption.decrypt_dict(encrypted)
         except Exception:
-            raise ValueError("Invalid import password")
-        
-        credentials = decrypted.get("credentials", {})
-        
+            raise ValueError("Invalid import password or corrupted export data")
+
         count = 0
         for name, cred_data in credentials.items():
             cred = Credential.from_dict(cred_data)
             self.store_credential(cred)
             count += 1
-        
+
         return count
 
 

@@ -198,6 +198,9 @@ class Recording:
         data.setdefault("audit_verification_goal", None)
         data.setdefault("step_screenshot_paths", {})
         data.setdefault("email_recipients", [])
+        # Filter to only known fields to avoid TypeError on unexpected keys
+        valid_fields = {f.name for f in fields(cls)}
+        data = {k: v for k, v in data.items() if k in valid_fields}
         return cls(**data)
     
     def save(self, path: Path) -> None:
@@ -455,6 +458,9 @@ class ActionRecorder:
                 delay_before=self._get_delay(),
                 description=f"Enter {self._current_credential[1]} for {self._current_credential[0]}"
             )
+            # Auto-reset sensitive mode after capturing the credential input
+            self._sensitive_mode = False
+            self._current_credential = None
         else:
             action = RecordedAction(
                 id=self._generate_action_id(),
