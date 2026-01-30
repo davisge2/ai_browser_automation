@@ -33,6 +33,11 @@ class RecordingModel(Base):
     # Playback settings
     speed_multiplier = Column(Float, default=1.0)
     verify_screenshots = Column(Boolean, default=True)
+
+    # Audit metadata
+    audit_purpose = Column(Text)
+    audit_verification_goal = Column(Text)
+    email_recipients = Column(JSON)  # List of email addresses for audit reports
     
     # Relationships
     schedules = relationship("ScheduleModel", back_populates="recording", cascade="all, delete-orphan")
@@ -86,7 +91,8 @@ class RunModel(Base):
     
     error_message = Column(Text)
     screenshots = Column(JSON)  # List of screenshot paths
-    
+    audit_report_path = Column(String(1024))
+
     # Relationships
     recording = relationship("RecordingModel", back_populates="runs")
     schedule = relationship("ScheduleModel", back_populates="runs")
@@ -132,18 +138,19 @@ class Database:
     
     # Recording operations
     def save_recording(
-        self, 
-        id: str, 
-        name: str, 
+        self,
+        id: str,
+        name: str,
         description: str,
         url: str,
         action_count: int,
-        file_path: str
+        file_path: str,
+        email_recipients: Optional[list] = None
     ) -> RecordingModel:
         """Save or update recording metadata."""
         with self.get_session() as session:
             recording = session.query(RecordingModel).filter_by(id=id).first()
-            
+
             if recording:
                 recording.name = name
                 recording.description = description
@@ -151,6 +158,8 @@ class Database:
                 recording.action_count = action_count
                 recording.file_path = file_path
                 recording.updated_at = datetime.utcnow()
+                if email_recipients is not None:
+                    recording.email_recipients = email_recipients
             else:
                 recording = RecordingModel(
                     id=id,
@@ -158,7 +167,8 @@ class Database:
                     description=description,
                     url=url,
                     action_count=action_count,
-                    file_path=file_path
+                    file_path=file_path,
+                    email_recipients=email_recipients
                 )
                 session.add(recording)
             

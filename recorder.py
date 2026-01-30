@@ -160,7 +160,13 @@ class Recording:
     speed_multiplier: float = 1.0
     verify_screenshots: bool = True
     retry_on_failure: int = 3
-    
+
+    # Audit metadata
+    audit_purpose: Optional[str] = None
+    audit_verification_goal: Optional[str] = None
+    step_screenshot_paths: Dict[str, str] = field(default_factory=dict)
+    email_recipients: List[str] = field(default_factory=list)
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "id": self.id,
@@ -175,13 +181,23 @@ class Recording:
             "speed_multiplier": self.speed_multiplier,
             "verify_screenshots": self.verify_screenshots,
             "retry_on_failure": self.retry_on_failure,
+            "audit_purpose": self.audit_purpose,
+            "audit_verification_goal": self.audit_verification_goal,
+            "step_screenshot_paths": self.step_screenshot_paths,
+            "email_recipients": self.email_recipients,
         }
-    
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Recording":
+        data = data.copy()
         data["created_at"] = datetime.fromisoformat(data["created_at"])
         data["updated_at"] = datetime.fromisoformat(data["updated_at"])
         data["actions"] = [RecordedAction.from_dict(a) for a in data["actions"]]
+        # Handle fields that may not exist in older recordings
+        data.setdefault("audit_purpose", None)
+        data.setdefault("audit_verification_goal", None)
+        data.setdefault("step_screenshot_paths", {})
+        data.setdefault("email_recipients", [])
         return cls(**data)
     
     def save(self, path: Path) -> None:
@@ -326,6 +342,7 @@ class ActionRecorder:
         
         self._screen_capture = ScreenCapture(storage_dir / "screenshots")
         self._actions: List[RecordedAction] = []
+        self._step_screenshots: Dict[str, str] = {}
         self._recording = False
         self._paused = False
         self._last_action_time: Optional[float] = None
@@ -339,6 +356,14 @@ class ActionRecorder:
         self._text_buffer = ""
         self._text_buffer_start_time: Optional[float] = None
         self._text_flush_delay = 0.5  # Seconds of inactivity before flushing
+
+        # Scroll accumulator for debouncing
+        self._scroll_buffer_x = 0
+        self._scroll_buffer_y = 0
+        self._scroll_last_x: Optional[int] = None
+        self._scroll_last_y: Optional[int] = None
+        self._scroll_start_time: Optional[float] = None
+        self._scroll_timer: Optional[threading.Timer] = None
         
         # Sensitive field tracking
         self._sensitive_mode = False
@@ -396,17 +421,22 @@ class ActionRecorder:
             logger.debug(f"Could not get window info: {e}")
             return None, None
     
+    @property
+    def step_screenshots(self) -> Dict[str, str]:
+        """Map of action_id to screenshot path for each recorded step."""
+        return self._step_screenshots.copy()
+
     def _record_action(self, action: RecordedAction) -> None:
         """Add action to recording."""
         if not self._recording or self._paused:
             return
-        
+
         with self._lock:
             self._actions.append(action)
-        
+
         if self.on_action:
             self.on_action(action)
-        
+
         logger.debug(f"Recorded: {action.action_type.value} - {action.description}")
     
     def _flush_text_buffer(self) -> None:
@@ -485,6 +515,9 @@ class ActionRecorder:
     def stop_recording(self) -> List[RecordedAction]:
         """Stop recording and return actions."""
         self._flush_text_buffer()
+        if self._scroll_timer is not None:
+            self._scroll_timer.cancel()
+        self._flush_scroll_buffer()
         self._recording = False
         
         if self._mouse_listener:
@@ -600,13 +633,46 @@ class ActionRecorder:
         self._record_action(action)
     
     def _on_mouse_scroll(self, x: int, y: int, dx: int, dy: int) -> None:
-        """Handle mouse scroll events."""
+        """Handle mouse scroll events with debouncing."""
+        if not self._recording or self._paused:
+            return
+
+        # Cancel pending flush timer
+        if self._scroll_timer is not None:
+            self._scroll_timer.cancel()
+
+        # Start accumulating
+        if self._scroll_start_time is None:
+            self._scroll_start_time = time.time()
+            self._scroll_buffer_x = 0
+            self._scroll_buffer_y = 0
+
+        self._scroll_buffer_x += dx
+        self._scroll_buffer_y += dy
+        self._scroll_last_x = x
+        self._scroll_last_y = y
+
+        # Flush after 300ms of no scroll events
+        self._scroll_timer = threading.Timer(0.3, self._flush_scroll_buffer)
+        self._scroll_timer.daemon = True
+        self._scroll_timer.start()
+
+    def _flush_scroll_buffer(self) -> None:
+        """Flush accumulated scroll events as a single action."""
+        if self._scroll_start_time is None:
+            return
+
+        dx = self._scroll_buffer_x
+        dy = self._scroll_buffer_y
+        x = self._scroll_last_x or 0
+        y = self._scroll_last_y or 0
+
         self._flush_text_buffer()
-        
+
         action = RecordedAction(
             id=self._generate_action_id(),
             action_type=ActionType.MOUSE_SCROLL,
-            timestamp=time.time(),
+            timestamp=self._scroll_start_time,
             x=x,
             y=y,
             dx=dx,
@@ -615,6 +681,11 @@ class ActionRecorder:
             description=f"Scroll ({dx}, {dy}) at ({x}, {y})"
         )
         self._record_action(action)
+
+        self._scroll_start_time = None
+        self._scroll_buffer_x = 0
+        self._scroll_buffer_y = 0
+        self._scroll_timer = None
     
     def _on_key_press(self, key) -> None:
         """Handle key press events."""

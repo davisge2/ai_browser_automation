@@ -39,5 +39,8 @@ numpy==1.26.3
 # System tray support
 pystray==0.19.5
 
+# AI Audit
+anthropic>=0.39.0
+
 # Cross-platform utilities
 pyperclip==1.8.2

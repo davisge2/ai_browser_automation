@@ -30,7 +30,9 @@ from recorder import ActionRecorder, RecordedAction, Recording, ActionType
 from playback import PlaybackEngine, PlaybackReport, PlaybackStatus
 from credentials import CredentialManager, Credential
 from scheduler import AutomationScheduler, Schedule, ScheduleFrequency, EmailConfig
-from database import Database
+from database import Database, RecordingModel
+from ai_engine import AIEngine, AuditContext, AuditReport, PerformanceMetrics, TimingData, StepAnalysis
+from report_generator import ReportGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -39,9 +41,10 @@ APP_DIR = Path.home() / ".desktop-automation"
 DATA_DIR = APP_DIR / "data"
 RECORDINGS_DIR = DATA_DIR / "recordings"
 SCREENSHOTS_DIR = DATA_DIR / "screenshots"
+REPORTS_DIR = DATA_DIR / "reports"
 DB_PATH = DATA_DIR / "automation.db"
 
-for d in [APP_DIR, DATA_DIR, RECORDINGS_DIR, SCREENSHOTS_DIR]:
+for d in [APP_DIR, DATA_DIR, RECORDINGS_DIR, SCREENSHOTS_DIR, REPORTS_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 
@@ -274,6 +277,266 @@ class EmailConfigDialog(QDialog):
             password=self.pass_input.text(),
             from_address=self.from_input.text().strip()
         )
+
+
+class NewRecordingDialog(QDialog):
+    """Dialog shown when starting a new recording — collects name, URL, and email."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("New Recording")
+        self.setMinimumWidth(480)
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.name_input = QLineEdit()
+        self.name_input.setPlaceholderText("e.g., Login Flow Test")
+        form.addRow("Recording Name:", self.name_input)
+
+        self.url_input = QLineEdit()
+        self.url_input.setPlaceholderText("https://... (optional)")
+        form.addRow("Starting URL:", self.url_input)
+
+        self.email_input = QLineEdit()
+        self.email_input.setPlaceholderText("user@example.com (comma-separated for multiple)")
+        form.addRow("Send report to:", self.email_input)
+
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def get_name(self) -> str:
+        return self.name_input.text().strip()
+
+    def get_url(self) -> str:
+        return self.url_input.text().strip()
+
+    def get_emails(self) -> list:
+        return [e.strip() for e in self.email_input.text().split(",") if e.strip()]
+
+
+class AuditContextDialog(QDialog):
+    """Dialog shown after recording stops to collect audit purpose and goal."""
+
+    def __init__(self, parent=None, purpose: str = "", goal: str = ""):
+        super().__init__(parent)
+        self.setWindowTitle("Audit Context")
+        self.setMinimumWidth(450)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Provide context for AI audit analysis (optional):"))
+
+        layout.addWidget(QLabel("What is the purpose of this recording?"))
+        self.purpose_input = QTextEdit()
+        self.purpose_input.setPlaceholderText("e.g., Verify login flow works correctly after deployment")
+        self.purpose_input.setMaximumHeight(80)
+        if purpose:
+            self.purpose_input.setPlainText(purpose)
+        layout.addWidget(self.purpose_input)
+
+        layout.addWidget(QLabel("What are you testing/verifying?"))
+        self.goal_input = QTextEdit()
+        self.goal_input.setPlaceholderText("e.g., User can log in with valid credentials and see dashboard")
+        self.goal_input.setMaximumHeight(80)
+        if goal:
+            self.goal_input.setPlainText(goal)
+        layout.addWidget(self.goal_input)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def get_purpose(self) -> str:
+        return self.purpose_input.toPlainText().strip()
+
+    def get_goal(self) -> str:
+        return self.goal_input.toPlainText().strip()
+
+
+class AuditThread(QThread):
+    """Background thread that runs AI audit analysis, generates HTML report, and emails it."""
+    progress = pyqtSignal(int, int)  # done, total
+    finished = pyqtSignal(str)       # report path
+    error = pyqtSignal(str)
+
+    def __init__(
+        self,
+        api_key: str,
+        recording: Recording,
+        report: PlaybackReport,
+        playback_screenshots: dict,
+        output_dir: str,
+        email_config: Optional[EmailConfig] = None,
+        email_recipients: Optional[list] = None,
+    ):
+        super().__init__()
+        self._api_key = api_key
+        self._recording = recording
+        self._report = report
+        self._playback_screenshots = playback_screenshots
+        self._output_dir = output_dir
+        self._email_config = email_config
+        self._email_recipients = email_recipients or []
+
+    def _send_report_email(self, report_html: str, report_path: str, recording_name: str):
+        """Send the HTML audit report embedded in the email body with HTML file attached."""
+        if not self._email_config or not self._email_recipients:
+            return
+
+        import smtplib
+        import ssl
+        from email.mime.multipart import MIMEMultipart
+        from email.mime.text import MIMEText
+        from email.mime.application import MIMEApplication
+
+        try:
+            cfg = self._email_config
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+            msg = MIMEMultipart("mixed")
+            msg["Subject"] = f"AI Audit Report: {recording_name} [{timestamp}]"
+            msg["From"] = cfg.from_address
+            msg["To"] = ", ".join(self._email_recipients)
+
+            # Embed full HTML report in email body
+            msg.attach(MIMEText(report_html, "html", "utf-8"))
+
+            # Also attach the HTML file for download
+            report_data = Path(report_path).read_bytes()
+            attachment = MIMEApplication(report_data, _subtype="html")
+            attachment.add_header(
+                "Content-Disposition", "attachment",
+                filename=Path(report_path).name
+            )
+            msg.attach(attachment)
+
+            context = ssl.create_default_context()
+            with smtplib.SMTP(cfg.smtp_host, cfg.smtp_port) as server:
+                if cfg.use_tls:
+                    server.starttls(context=context)
+                server.login(cfg.username, cfg.password)
+                server.send_message(msg)
+
+            logger.info(f"Audit report emailed to {self._email_recipients}")
+
+        except Exception as e:
+            logger.error(f"Failed to email audit report: {e}")
+
+    def run(self):
+        try:
+            engine = AIEngine(self._api_key)
+            rec = self._recording
+            report = self._report
+
+            context = AuditContext(
+                recording_name=rec.name,
+                recording_id=rec.id,
+                purpose=rec.audit_purpose or "",
+                verification_goal=rec.audit_verification_goal or "",
+                url=rec.url,
+                total_steps=len(rec.actions),
+            )
+
+            # Build step analyses with timing (no per-step AI calls)
+            step_analyses = []
+            screenshot_steps = []  # only steps with playback screenshots
+            for idx, action in enumerate(rec.actions):
+                play_ss = self._playback_screenshots.get(action.id)
+                sa = StepAnalysis(
+                    step_index=idx,
+                    action_id=action.id,
+                    action_type=action.action_type.value,
+                    action_description=action.description or "",
+                    play_screenshot_path=play_ss,
+                    has_screenshot=bool(play_ss),
+                )
+                if idx < len(report.results):
+                    pr = report.results[idx]
+                    sa.timing = TimingData(
+                        recording_timestamp=action.timestamp,
+                        playback_duration_ms=pr.duration_ms,
+                        page_load_time_ms=pr.page_load_time_ms,
+                    )
+                step_analyses.append(sa)
+
+                if play_ss and Path(play_ss).exists():
+                    screenshot_steps.append({
+                        "index": idx,
+                        "action_type": action.action_type.value,
+                        "description": action.description or "",
+                        "play_screenshot": play_ss,
+                    })
+
+            self.progress.emit(0, 2)
+
+            # Performance metrics
+            perf = PerformanceMetrics()
+            if rec.actions:
+                perf.total_recording_time_s = rec.actions[-1].timestamp - rec.actions[0].timestamp
+            perf.total_playback_time_s = report.duration_seconds
+            durations = [r.duration_ms for r in report.results]
+            if durations:
+                perf.avg_step_duration_ms = sum(durations) / len(durations)
+                perf.slowest_step_duration_ms = max(durations)
+                perf.slowest_step_index = durations.index(perf.slowest_step_duration_ms)
+            for idx, r in enumerate(report.results):
+                if r.page_load_time_ms is not None:
+                    perf.page_load_times.append({"step": idx + 1, "time_ms": r.page_load_time_ms})
+
+            # API call 1: Analyze screenshots (single call with all images)
+            screenshot_analysis = engine.analyze_screenshots(screenshot_steps, context, perf)
+            self.progress.emit(1, 2)
+
+            # API call 2: Executive summary
+            executive_summary = engine.generate_executive_summary(
+                context, perf, screenshot_analysis,
+                total_actions=report.total_actions,
+                completed_actions=report.completed_actions,
+                failed_actions=report.failed_actions,
+            )
+            self.progress.emit(2, 2)
+
+            # Assemble report
+            from datetime import datetime as dt
+            audit_report = AuditReport(
+                context=context,
+                step_analyses=step_analyses,
+                findings=[],
+                performance=perf,
+                executive_summary=executive_summary,
+                screenshot_analysis=screenshot_analysis,
+                generated_at=dt.now().strftime("%Y-%m-%d %H:%M:%S"),
+                ai_model_used=engine.ai_model_used,
+                total_api_calls=engine.total_api_calls,
+                estimated_cost_usd=engine.estimated_cost_usd,
+            )
+
+            # Generate HTML
+            gen = ReportGenerator()
+            output_path = str(
+                Path(self._output_dir) / f"audit_{rec.id}_{dt.now().strftime('%Y%m%d_%H%M%S')}.html"
+            )
+            gen.generate(audit_report, output_path)
+
+            # Email the full HTML report embedded in body + attached as file
+            if self._email_recipients:
+                report_html = gen.get_html(audit_report)
+                self._send_report_email(report_html, output_path, rec.name)
+
+            self.finished.emit(output_path)
+
+        except Exception as e:
+            logger.error(f"Audit failed: {e}", exc_info=True)
+            self.error.emit(str(e))
 
 
 class RecordingToolbar(QWidget):
@@ -516,6 +779,11 @@ class MainWindow(QMainWindow):
         self.delete_btn.clicked.connect(self._delete_recording)
         self.delete_btn.setEnabled(False)
         btn_row.addWidget(self.delete_btn)
+
+        self.edit_context_btn = QPushButton("📝 Edit AI Context")
+        self.edit_context_btn.clicked.connect(self._edit_audit_context)
+        self.edit_context_btn.setEnabled(False)
+        btn_row.addWidget(self.edit_context_btn)
         right.addLayout(btn_row)
         
         layout.addLayout(right, 2)
@@ -683,6 +951,42 @@ class MainWindow(QMainWindow):
         if saved_folder:
             self.screenshot_folder_label.setText(saved_folder)
 
+        # AI Audit settings
+        ai_group = QGroupBox("AI Audit (Anthropic Claude)")
+        ai_layout = QVBoxLayout(ai_group)
+
+        self.ai_enabled_cb = QCheckBox("Enable AI audit after playback")
+        self.ai_enabled_cb.setChecked(bool(self.db.get_setting("ai_audit_enabled", False)))
+        self.ai_enabled_cb.stateChanged.connect(
+            lambda state: self.db.set_setting("ai_audit_enabled", state == Qt.CheckState.Checked.value)
+        )
+        ai_layout.addWidget(self.ai_enabled_cb)
+
+        api_row = QHBoxLayout()
+        api_row.addWidget(QLabel("API Key:"))
+        self.api_key_input = QLineEdit()
+        self.api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.api_key_input.setPlaceholderText("sk-ant-...")
+        saved_key = self.db.get_setting("anthropic_api_key", "")
+        if saved_key:
+            self.api_key_input.setText(saved_key)
+        api_row.addWidget(self.api_key_input, 1)
+        save_key_btn = QPushButton("Save")
+        save_key_btn.clicked.connect(self._save_api_key)
+        api_row.addWidget(save_key_btn)
+        ai_layout.addLayout(api_row)
+
+        report_row = QHBoxLayout()
+        report_row.addWidget(QLabel("Report folder:"))
+        self.report_folder_label = QLabel(self.db.get_setting("report_output_dir") or "Default")
+        report_row.addWidget(self.report_folder_label, 1)
+        report_browse_btn = QPushButton("Browse...")
+        report_browse_btn.clicked.connect(self._browse_report_folder)
+        report_row.addWidget(report_browse_btn)
+        ai_layout.addLayout(report_row)
+
+        layout.addWidget(ai_group)
+
         email_group = QGroupBox("Email")
         email_layout = QVBoxLayout(email_group)
         self.email_status = QLabel("Not configured")
@@ -776,16 +1080,19 @@ class MainWindow(QMainWindow):
             self._start_recording()
     
     def _start_recording(self):
-        name, ok = QInputDialog.getText(self, "New Recording", "Name:")
-        if not ok or not name:
+        dlg = NewRecordingDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        
-        url, _ = QInputDialog.getText(self, "URL", "Starting URL (optional):")
-        
+        name = dlg.get_name()
+        if not name:
+            return
+        url = dlg.get_url()
+        emails = dlg.get_emails()
+
         self.current_recording = Recording(
             id=str(uuid.uuid4()), name=name, description="",
             created_at=datetime.now(), updated_at=datetime.now(),
-            url=url or None, actions=[]
+            url=url or None, actions=[], email_recipients=emails
         )
 
         # Open Chrome to the URL before recording starts
@@ -861,17 +1168,27 @@ class MainWindow(QMainWindow):
         
         if self.current_recording and actions:
             self.current_recording.actions = actions
+            # Store step screenshots from recorder
+            self.current_recording.step_screenshot_paths = self.recorder.step_screenshots
+
+            # Show audit context dialog
+            dlg = AuditContextDialog(self)
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                self.current_recording.audit_purpose = dlg.get_purpose()
+                self.current_recording.audit_verification_goal = dlg.get_goal()
+
             path = RECORDINGS_DIR / f"{self.current_recording.id}.json"
             self.current_recording.save(path)
-            
+
             self.db.save_recording(
                 id=self.current_recording.id, name=self.current_recording.name,
                 description="", url=self.current_recording.url or "",
-                action_count=len(actions), file_path=str(path)
+                action_count=len(actions), file_path=str(path),
+                email_recipients=getattr(self.current_recording, 'email_recipients', None) or []
             )
             self.statusBar().showMessage(f"Saved {len(actions)} actions")
             self._load_recordings()
-        
+
         self.current_recording = None
         self.recording_label.setText("")
     
@@ -920,6 +1237,7 @@ class MainWindow(QMainWindow):
         self.play_btn.setEnabled(enabled)
         self.schedule_btn.setEnabled(enabled)
         self.delete_btn.setEnabled(enabled)
+        self.edit_context_btn.setEnabled(enabled)
         
         if not current:
             return
@@ -962,6 +1280,42 @@ class MainWindow(QMainWindow):
         self._load_history()
         self._load_screenshots()
 
+        # Check if AI audit is enabled
+        ai_enabled = self.db.get_setting("ai_audit_enabled", False)
+        api_key = self.db.get_setting("anthropic_api_key", "")
+        if ai_enabled and api_key:
+            # Get the recording object
+            item = self.recordings_list.currentItem()
+            rec = item.data(Qt.ItemDataRole.UserRole) if item else None
+            if rec:
+                playback_ss = self.playback_engine.step_screenshots
+                report_dir = self.db.get_setting("report_output_dir") or str(REPORTS_DIR)
+                Path(report_dir).mkdir(parents=True, exist_ok=True)
+
+                self._audit_progress_label = QLabel("AI Audit: 0/0 steps...")
+                self.statusBar().addWidget(self._audit_progress_label)
+
+                # Load email config for sending report
+                email_cfg_data = self.db.get_setting("email_config")
+                email_cfg = EmailConfig.from_dict(email_cfg_data) if email_cfg_data else None
+                email_recipients = getattr(rec, 'email_recipients', None) or []
+
+                self._audit_thread = AuditThread(
+                    api_key=api_key,
+                    recording=rec,
+                    report=report,
+                    playback_screenshots=playback_ss,
+                    output_dir=report_dir,
+                    email_config=email_cfg,
+                    email_recipients=email_recipients,
+                )
+                self._audit_thread.progress.connect(self._on_audit_progress)
+                self._audit_thread.finished.connect(self._on_audit_finished)
+                self._audit_thread.error.connect(self._on_audit_error)
+                self._audit_thread.start()
+                self.statusBar().showMessage("Running AI audit analysis...")
+                return
+
         if report.status == PlaybackStatus.COMPLETED:
             ss_count = len(report.screenshots)
             msg = f"Completed {report.completed_actions} actions"
@@ -972,6 +1326,25 @@ class MainWindow(QMainWindow):
                 self.tabs.setCurrentIndex(1)  # Switch to Screenshots tab
         else:
             QMessageBox.warning(self, "Failed", report.error_message or "Playback failed")
+
+    def _on_audit_progress(self, done, total):
+        if hasattr(self, '_audit_progress_label'):
+            self._audit_progress_label.setText(f"AI Audit: {done}/{total} steps...")
+
+    def _on_audit_finished(self, report_path):
+        if hasattr(self, '_audit_progress_label'):
+            self.statusBar().removeWidget(self._audit_progress_label)
+        self.statusBar().showMessage(f"Audit report saved: {report_path}")
+
+        # Open report in browser
+        import webbrowser
+        webbrowser.open(f"file:///{report_path}")
+
+    def _on_audit_error(self, error_msg):
+        if hasattr(self, '_audit_progress_label'):
+            self.statusBar().removeWidget(self._audit_progress_label)
+        self.statusBar().showMessage("AI audit failed")
+        QMessageBox.warning(self, "Audit Error", f"AI audit failed:\n{error_msg}")
     
     def _schedule_recording(self):
         item = self.recordings_list.currentItem()
@@ -1009,6 +1382,40 @@ class MainWindow(QMainWindow):
         self.db.delete_recording(rec.id)
         self._load_recordings()
     
+    def _edit_audit_context(self):
+        item = self.recordings_list.currentItem()
+        if not item:
+            return
+        rec = item.data(Qt.ItemDataRole.UserRole)
+
+        dlg = AuditContextDialog(
+            self,
+            purpose=rec.audit_purpose or "",
+            goal=rec.audit_verification_goal or "",
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        rec.audit_purpose = dlg.get_purpose()
+        rec.audit_verification_goal = dlg.get_goal()
+
+        # Save to JSON file
+        path = RECORDINGS_DIR / f"{rec.id}.json"
+        if path.exists():
+            rec.save(path)
+
+        # Update DB
+        with self.db.get_session() as session:
+            db_rec = session.query(RecordingModel).filter_by(id=rec.id).first()
+            if db_rec:
+                db_rec.audit_purpose = rec.audit_purpose
+                db_rec.audit_verification_goal = rec.audit_verification_goal
+                session.commit()
+
+        # Update the item data
+        item.setData(Qt.ItemDataRole.UserRole, rec)
+        self.statusBar().showMessage("Audit context updated")
+
     # Schedules
     def _run_schedule_now(self):
         row = self.schedules_table.currentRow()
@@ -1093,6 +1500,21 @@ class MainWindow(QMainWindow):
         folder = self._get_screenshot_folder()
         folder.mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+
+    def _save_api_key(self):
+        key = self.api_key_input.text().strip()
+        if key:
+            self.db.set_setting("anthropic_api_key", key)
+            self.statusBar().showMessage("API key saved")
+        else:
+            QMessageBox.warning(self, "Invalid", "Enter a valid API key")
+
+    def _browse_report_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Report Output Folder")
+        if folder:
+            self.db.set_setting("report_output_dir", folder)
+            self.report_folder_label.setText(folder)
+            self.statusBar().showMessage(f"Report folder: {folder}")
 
     def _set_master_password(self):
         pwd, ok = QInputDialog.getText(self, "Password", "Master password:", QLineEdit.EchoMode.Password)

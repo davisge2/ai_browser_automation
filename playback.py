@@ -28,6 +28,7 @@ from PIL import Image
 
 from recorder import RecordedAction, ActionType, Recording, ScreenRegion, ScreenCapture
 from credentials import CredentialManager, SecureInput
+from page_monitor import PageLoadTimer
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,7 @@ class PlaybackResult:
     screenshot_path: Optional[str] = None
     retry_count: int = 0
     duration_ms: int = 0
+    page_load_time_ms: Optional[int] = None
 
 
 @dataclass
@@ -190,6 +192,8 @@ class PlaybackEngine:
         
         self._screen_capture = ScreenCapture(storage_dir / "playback_screenshots")
         self._verifier = VisualVerifier(self._screen_capture)
+        self._step_screenshots: Dict[str, str] = {}
+        self._page_load_timer = PageLoadTimer()
         self.screenshot_output_dir: Optional[Path] = None
 
         self._status = PlaybackStatus.IDLE
@@ -234,6 +238,7 @@ class PlaybackEngine:
         self.verify_visuals = verify_visuals
         self._abort_requested = False
         self._current_action_index = 0
+        self._step_screenshots = {}
         
         report = PlaybackReport(
             recording_id=recording.id,
@@ -335,16 +340,33 @@ class PlaybackEngine:
                 
                 # Execute action
                 screenshot_path = self._execute_action(action)
-                
+
+                # Measure page load time for URL/click actions
+                page_load_ms = None
+                if action.action_type in (ActionType.OPEN_URL, ActionType.MOUSE_CLICK):
+                    try:
+                        page_load_ms = self._page_load_timer.measure_load_time(timeout_ms=10000)
+                    except Exception as e:
+                        logger.debug(f"Page load timing failed: {e}")
+
+                # Capture step screenshot only for explicit screenshot actions
+                if action.action_type == ActionType.SCREENSHOT:
+                    try:
+                        step_ss = self._screen_capture.capture_full_screen()
+                        self._step_screenshots[action.id] = step_ss
+                    except Exception as e:
+                        logger.debug(f"Step screenshot failed: {e}")
+
                 duration_ms = int((time.time() - start_time) * 1000)
-                
+
                 return PlaybackResult(
                     success=True,
                     action_id=action.id,
                     action_type=action.action_type,
                     screenshot_path=screenshot_path,
                     retry_count=attempt,
-                    duration_ms=duration_ms
+                    duration_ms=duration_ms,
+                    page_load_time_ms=page_load_ms,
                 )
                 
             except Exception as e:
@@ -588,6 +610,11 @@ class PlaybackEngine:
         self._pause_event.set()  # Unblock if paused
         logger.info("Playback abort requested")
     
+    @property
+    def step_screenshots(self) -> Dict[str, str]:
+        """Map of action_id to screenshot path captured during playback."""
+        return self._step_screenshots.copy()
+
     @property
     def status(self) -> PlaybackStatus:
         return self._status
