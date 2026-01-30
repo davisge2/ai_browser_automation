@@ -1,0 +1,43 @@
+# Desktop Automation Recorder
+# Production Dependencies
+
+# GUI Framework
+PyQt6==6.6.1
+PyQt6-Qt6==6.6.1
+
+# Input Recording & Playback
+pynput==1.7.6
+pyautogui==0.9.54
+keyboard==0.13.5
+
+# Screenshots
+mss==9.0.1
+Pillow==10.2.0
+
+# Secure Credential Storage
+keyring==24.3.0
+cryptography==41.0.7
+
+# Scheduling
+apscheduler==3.10.4
+
+# Email
+aiosmtplib==3.0.1
+
+# Database
+sqlalchemy==2.0.25
+
+# Configuration
+pydantic==2.5.3
+pydantic-settings==2.1.0
+python-dotenv==1.0.0
+
+# Image Recognition (for reliable element finding)
+opencv-python==4.9.0.80
+numpy==1.26.3
+
+# System tray support
+pystray==0.19.5
+
+# Cross-platform utilities
+pyperclip==1.8.2
